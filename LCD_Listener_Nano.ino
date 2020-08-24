@@ -1,4 +1,17 @@
 #include <EtherCard.h>
+#include <LiquidCrystal.h>
+
+/**
+ * Xmutantson: So this code is heavily based on ModLogNet's code on github. https://github.com/ModLogNet/CDP-LLDP-with-arduino/blob/master/LCD_Listener_Nano.ino#L230
+ * Most of the code that I wrote is heavy and slow but the CDP part works so far. The LLDP hasnt got LCD outputs programmed yet.
+ * I couldnt figure out how to display VLAN information. Also if CDP and LLDP are on at the same time or if it recieves no data in some of the LCD_data,
+ * then LCD_data[#] will contain old junk data. Some kind of LCD_data clearing needs to happen on each new packet rx. I tried to write them on each packet rx
+ * but I dont know what I'm doing and I get the idea that the heap is getting screwed somehow. Speaking of heap, im using F() everywhere because otherwise there's not enough ram to go around.
+ * also, with my test samples my packets arent larger than 400 bytes so the buffer could be turned down depending on how big the packets are. unfortunately we cant use the 
+ * SRAM on the encj2860 because ethercard.h doesnt take it into account and we gotta load the whole packet in ram.
+ * 
+ * Improvements would be welcomed. Current SRAM usage is around 65% at compile time
+*/
 // ethernet interface mac address, must be unique on the LAN
 byte cdp_mac[] = {
   0x01, 0x00, 0x0c, 0xcc, 0xcc, 0xcc
@@ -6,109 +19,179 @@ byte cdp_mac[] = {
 byte mymac[] = {
   0x00, 0x01, 0x02, 0x03, 0x04, 0x05
 };
+
 //-------------------NEW------------
 byte lldp_mac[] = {0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e};
 int rbuflen;
-char TLVTYPE[3];
-char TLVLENGTH[3];
+
 //----------------------------------
+
+const int rs = A5, en = A4, d4 = A0, d5 = A1, d6 = A2, d7 = A3; //set up 1602 to dodge the pins the ethernet shield is using by relocating to the other pin row >:(
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7); //for the *lcd.xyz();* commands later
+
+unsigned long previousMillis = 0;        // will store last time LCD was updated. First thing in the state machine code
+const long interval = 250;        // interval at which to update LCD (milliseconds)
+unsigned long lcdCount = 0;          //depends on interval. increments when state machine content is called.
+//creates delay multiplier for displaying successive lines of data in one run.
+//eg when interval is 150, if lcdCount reaches 10 and something is waiting
+//for it to be >= than that then it will wait 1.5 seconds and do something
+
+int LCD_Window_control = 90; //this controls how many window cycles until you reset to the top, W1L1. controls window so as not to cycle through unused W#L#
+//10 means only show the first window. 20 means show 1 and 2. 30 = 3 windows, etc. set to 9 windows
+//window count currently active should be assertively limited by subroutines so if this remains 90 it's in error. I'll write a handler later
+
 #define MAC_LENGTH 6
-byte Ethernet::buffer[501];
+byte Ethernet::buffer[500];
 
 int Device = 0;
 int Port = 0;
+int SWver = 0;
 int Model = 0;
-String Protocal;
-String LCD_data[8];
-String Names[8] = {
-  "Name:", "MAC:" , "Port:", "Model:", "VLAN:", "IP:", "Voice VLAN:", "Cap:"
-};
+int CrntItem = 0;
+int ValidPacket = 0;
+String LCD_data[7];
 
-#include <Adafruit_GFX.h>    // Core graphics librar
-#include <Adafruit_ST7735.h> // Hardware-specific library
+char* ipTemplate = "";
+char* macTemplate = "";
+
+//messages per message window and line
+//These are default values loaded when the program first initializes and if you see them after writing to the charstrings then you're doing something wrong.
+char W1L1[17] = ""; //WINDOWS 1 2 3 4 5 6 7 WITH LINE 1 2 BREAKOUTS
+char W1L2[17] = ""; //remember to use the leading space for the activity character and keep total msg to 16char
+char W2L1[17] = "";
+char W2L2[17] = "";
+char W3L1[17] = "Device";
+char W3L2[17] = "";
+char W4L1[17] = "SwDevMAC:";
+char W4L2[17] = "";
+char W5L1[17] = "Port:";
+char W5L2[17] = ""; //this one will be trimmed to final 16 digits
+unsigned int sizeW5L2_Input = 0;                 //this is needed to figure out the size of whats going into the chararray and to iterate through the last 16 digits
+char W6L1[17] = "Model:";
+char W6L2[17] = ""; //this one will be trimmed to final 16 digits
+unsigned int sizeW6L2_Input = 0;                 //same function as above
+char W7L1[17] = "VLAN:";
+char W7L2[17] = "";
+
+//be careful and watch the ram when you write more of these
+
 #include <SPI.h>
 
-//Use these pins for the shield!
+//Use these pins for the ethernet shield!
 #define sclk 13
 #define mosi 11
-#define cs   4
+#define cs   3
 #define dc   8
-#define rst  9  // you can also connect this to the Arduino reset
-
-// Option 1: use any pins but a little slower
-Adafruit_ST7735 tft = Adafruit_ST7735(cs, dc, rst);
+#define rst  -1  // you can also connect this to the Arduino reset
 
 void setup()
 {
-  //  tft.fillScreen(ST7735_BLACK);
+//speaking of ram usage, if you ever print something static you should use a flash string. Serial.print(F("something"));
   pinMode(13, OUTPUT);
   Serial.begin(9600);
-  Serial.println("Serial Initialised\nScreen Initialising");
-  tft.initR(INITR_BLACKTAB);   // initialize a ST7735S chip, black tab
-  Serial.println("Screen Done");
+  Serial.println(F("hello!"));
+  Serial.println(F("init.."));
+  //init lcd and display a starting sequence message. have to do it manually because the dynamic loop cant be called yet
+  lcd.begin(16, 2);
 
-  tft.fillScreen(ST7735_BLACK);
-
-  tft.setTextWrap(false);
-  tft.setRotation(1);
-  tft.setCursor(0, 0);
-  drawscreen();
-  // testdrawtext("Default Interval is 60secs!\n", ST7735_RED);
-  // testdrawtext("DHCP:", ST7735_BLUE);
-
+  lcd.print(F("Arduino Ethernet"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("CDP/LLDP reader "));
+  delay(1500); //somewhat arbitrary, to allow you to actually read the first window
+  lcd.setCursor(0, 0);
+  lcd.print(F("Cred: Xmutantson"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("&ModLogNetgithub"));
+  delay(1000); 
+  lcd.setCursor(0, 0);
+  lcd.print(F("CDP Takes `60sec"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("to be detected! "));
+  delay(1000);
+  lcd.setCursor(0, 0);
+  lcd.print(F("Waiting for IP  "));
+  lcd.setCursor(0, 1);
+  lcd.print(F("from DHCP server"));
   ether.begin(sizeof Ethernet::buffer, mymac, 10);
-  Serial.println("Ethernet Done");
+
   if (!ether.dhcpSetup())
   {
-    // testdrawtext("DHCP failed.\n", ST7735_RED);
-    Serial.println("DHCP failed.");
+
+    strcpy(W1L1, "DHCP failed.....");
+    strcpy(W1L2, " Restart tool or");
+    strcpy(W2L1, " Restart tool or");
+    strcpy(W2L2, " check DHCP svr ");
+    strcpy(W3L1, " check DHCP svr ");
+    strcpy(W3L2, " or port wiring.");
+    LCD_Window_control = 29;
+    Serial.println(F("DHCP FailWHACK!"));
   }
   else
   {
-    drawscreen();
-    // testdrawtext("DHCP IP:", ST7735_GREEN);
-    Serial.print("DHCP IP:");
-    for (unsigned int j = 0; j < 4; ++j) {
-      Serial.print(String(ether.myip[j]));
-      // testdrawtext(String(ether.myip[j]), ST7735_WHITE);
-      if (j < 3) {
-        Serial.print(".");
-        //  testdrawtext(".", ST7735_WHITE);
-      }
-    }
-    //testdrawtext("\n", ST7735_WHITE);
-    Serial.print("\n");
-  }
-  delay(200);
-  ENC28J60::enablePromiscuous();
-  Serial.println("Ethernet Promiscuous");
-  // ether.printIp("GW: ", ether.gwip);
+    //    testdrawtext("DHCP IP:",ST7735_GREEN);
+    strcpy(W1L1, "My DHCP IP:     ");
+    Serial.println(W1L1);
+    ipTemplate = "%d.%d.%d.%d"; //this breaks the leading space rule because it has to to fit the full address
+    sprintf(W1L2, ipTemplate, ether.myip[0],  ether.myip[1],  ether.myip[2],  ether.myip[3]); //convert the bytearray ether.myip to char and write to W1L2
+    Serial.println(W1L2); //print what's going to this spot in the display window/line cycle
+    Serial.println(F("DHCP IP OBTAINED!"));  //serial print ack of getting dhcp working
 
+    delay(1000);
+    ENC28J60::enablePromiscuous();
+
+    // ether.printIp("GW: ", ether.gwip);
+    strcpy(W2L1, "Gateway IP:     ");
+    Serial.println(W2L1);
+    ipTemplate = "%d.%d.%d.%d"; //this breaks the leading space rule because it has to to fit the full address
+    sprintf(W2L2, ipTemplate, ether.gwip[0],  ether.gwip[1],  ether.gwip[2],  ether.gwip[3]); //convert the bytearray ether.myip to char and write to W1L2
+    Serial.println(W2L2); //print what's going to this spot in the display window/line cycle
+    Serial.println(F("Gateway IP OBTAINED!"));  //serial print ack of getting dhcp working
+  }
 }
 void loop()
 {
+
+  unsigned long currentMillis = millis();   //state machine guts. whatever is in the if will get run once per second
+  if (currentMillis - previousMillis >= interval) {
+    // save the last time you blinked the LED
+    previousMillis = currentMillis;
+    LCDupdate();                            //call lcdupdate
+    if (lcdCount >= 10000) {                //watchdog to make sure lcdCount doesnt have unpredictable behavior after ~8 hours (when the long runs out)?? just tryin to be careful haha
+      lcdCount = 0;
+    }
+    lcdCount++;                         //increment lcdCount to tell program how many times we've pulsed the lcd
+    //Serial.println("lcdWHACK!");      //state machine indicator
+    //Serial.println(lcdCount);         //lcdCount indicator
+  }
+
   int plen = ether.packetReceive();
   if ( plen > 0 ) {
 
+ 
     if (byte_array_contains(Ethernet::buffer, 0, cdp_mac, sizeof(cdp_mac))) {
 
-      //CDP Packet found and is now getting processed
+      //Protocal = "CDP";
+      Serial.println(F("CDP Packet Received"));
+/**   this crashes the arduino
+ //clear LCD data on new CDP packet rx
+      LCD_data[0] = F("");
+      LCD_data[1] = F("");
+      LCD_data[2] = F("");
+      LCD_data[3] = F("");
+      LCD_data[4] = F("");
+      LCD_data[5] = F("");
+      LCD_data[6] = F("");
+      LCD_data[7] = F("");
+*/
+      byte* macFrom = Ethernet::buffer + sizeof(cdp_mac);
 
-      Protocal = "CDP";
-      Serial.println("CDP Packet Received");
-
-      //Get source MAC Address
-
+      //Get source MAC address
       LCD_data[1] = print_mac(Ethernet::buffer, sizeof(cdp_mac), 6);
 
-
-
-
-      //Set start hex address
       int DataIndex = 26;
 
-      //Cycle through the frame reading the TLV fields
-      while (DataIndex < plen) {
+      while (DataIndex < plen) { // read all remaining TLV fields //checks to make sure packet is at least 27 long (28 bytes) before checking for details
+
         unsigned int cdpFieldType = (Ethernet::buffer[DataIndex] << 8) | Ethernet::buffer[DataIndex + 1];
         DataIndex += 2;
         unsigned int TLVFieldLength = (Ethernet::buffer[DataIndex] << 8) | Ethernet::buffer[DataIndex + 1];
@@ -116,45 +199,31 @@ void loop()
         TLVFieldLength -= 4;
 
         switch (cdpFieldType) {
-
-          case 0x0001: //CDP Device name
+          case 0x0001: //device
             Device = 1;
-            handleCdpAsciiField(Ethernet::buffer, DataIndex, TLVFieldLength);
+            handlePacketAsciiField(Ethernet::buffer, DataIndex, TLVFieldLength);
             Device = 0;
             break;
-
-          case 0x0002: //CDP IP address
-            handleCdpAddresses(Ethernet::buffer, DataIndex, TLVFieldLength);
+          case 0x0002:
+            handleCdpAddresses(Ethernet::buffer, DataIndex, TLVFieldLength); //doesnt work well because the CDP packets i have in the capture are anonymized
             break;
-
-          case 0x0003: //CDP Port Name
+          case 0x0003: //port
             Port = 1;
-            handleCdpAsciiField( Ethernet::buffer, DataIndex, TLVFieldLength);
+            handlePacketAsciiField(Ethernet::buffer, DataIndex, TLVFieldLength);
             Port = 0;
             break;
+          //    case 0x0004:
+          //     handleCdpCapabilities(Ethernet::buffer, DataIndex, TLVFieldLength);
+          //    break;
 
-          /* case 0x0004: //Capabilities
-            handleCdpCapabilities(Ethernet::buffer, DataIndex + 2, TLVFieldLength - 2);
-            break; */
-
-
-          case 0x0006: //CDP Model Name
+          case 0x0006: //model
             Model = 1;
-            handleCdpAsciiField( Ethernet::buffer, DataIndex, TLVFieldLength);
+            handlePacketAsciiField(Ethernet::buffer, DataIndex, TLVFieldLength);
             Model = 0;
             break;
-
-          case 0x000a: //CDP VLAN #
-            handleCdpNumField( Ethernet::buffer, DataIndex, TLVFieldLength);
+          case 0x000a: //vlan #
+            handlePacketNumField(Ethernet::buffer, DataIndex, TLVFieldLength);
             break;
-
-          /* case 0x000b:
-            SWver = 1;
-            if (TLVFieldLength > 50) {    TLVFieldLength = 50;}
-            handleCdpAsciiField( Ethernet::buffer, DataIndex, TLVFieldLength);
-            SWver = 0;
-            break; */
-
 
           case 0x000e: //CDP VLAN voice#
             handleCdpVoiceVLAN( Ethernet::buffer, DataIndex + 2, TLVFieldLength - 2);
@@ -162,35 +231,81 @@ void loop()
         }
         DataIndex += TLVFieldLength;
       }
-      drawscreen();
+      //Serial.println("--------END-------");
+      Serial.println(F("LCD_data dump"));
+      Serial.println(LCD_data[0]);
+      Serial.println(LCD_data[1]); //mac address
+      Serial.println(LCD_data[2]);
+      Serial.println(LCD_data[3]);
+      Serial.println(LCD_data[4]); //vlan
+      Serial.println(LCD_data[5]);
+      Serial.println(LCD_data[6]);
+      Serial.println(F("dump complete"));
+
+      Serial.println(F("we're now writing CDP to display windows"));
+
+      strcpy(W3L1, "CDPDevID:       "); //LCD_data[0] Name
+      strcpy(W3L2, LCD_data[0].c_str()); //LCD_data[0] Data
+
+      //Serial.println("splitDevMAC");
+      //Serial.println(LCD_data[1].c_str());
+      strcpy(W4L1, "CDPDevMAC:      "); //1 space
+      strcpy(W4L2, (LCD_data[1].c_str()));
+
+      //Serial.println((LCD_data[2].substring(sizeW5L2_Input-16, sizeW5L2_Input)).c_str());
+      sizeW5L2_Input = (LCD_data[2].length());
+      strcpy(W5L1, "Port ID: (trim) "); //LCD_data[2] Name
+      strcpy(W5L2, (LCD_data[2].substring(sizeW5L2_Input - 16, sizeW5L2_Input)).c_str()); //LCD_data[2] Data
+
+      sizeW6L2_Input = (LCD_data[3].length());
+      strcpy(W6L1, "Model No: (trim)"); //LCD_data[3] Name
+      strcpy(W6L2, (LCD_data[3].substring(sizeW6L2_Input - 16, sizeW6L2_Input)).c_str()); //LCD_data[3] Data
+
+      strcpy(W7L1, "VLAN ID:        "); //LCD_data[4] Name
+      strcpy(W7L2, LCD_data[4].c_str()); //LCD_data[4] Data
+      //splitDevMAC(); //call parse and display device mac routine. uses W4
+
+      //update the display window!
+      LCD_Window_control = 70;
+
     }
-
-    if (byte_array_contains(Ethernet::buffer, 0, lldp_mac, sizeof(lldp_mac))) {
-
-      //CDP Packet found and is now getting processed
-      Protocal = "LLDP";
-      Serial.println("LLPD Packet Received");
-
+    //LLDP STUFF NOW
+    
+      if (byte_array_contains(Ethernet::buffer, 0, lldp_mac, sizeof(lldp_mac))) {
+      
+      //LLDP Packet found and is now getting processed
+      //Protocal = "LLDP";
+      Serial.println(F("LLDP Packet Received"));
+/** this crashes the arduino
+      //clear LCD data on new LLDP packet rx
+      LCD_data[0] = F("");
+      LCD_data[1] = F("");
+      LCD_data[2] = F("");
+      LCD_data[3] = F("");
+      LCD_data[4] = F("");
+      LCD_data[5] = F("");
+      LCD_data[6] = F("");
+      LCD_data[7] = F("");
+*/      
       LCD_data[1] = print_mac(Ethernet::buffer, sizeof(lldp_mac), 6);
 
       int DataIndex = 14;
 
       while (DataIndex < plen) { // read all remaining TLV fields
-        unsigned int cdpFieldType = (Ethernet::buffer[DataIndex]);
+        unsigned int lldpFieldType = (Ethernet::buffer[DataIndex]);
         DataIndex += 1;
         unsigned int TLVFieldLength = (Ethernet::buffer[DataIndex]);
-        /*Serial.print(" type:");
-          Serial.print(cdpFieldType, HEX);
+        Serial.print(" type:");
+          Serial.print(lldpFieldType, HEX);
           Serial.print(" Length:");
-          Serial.print(TLVFieldLength);*/
+          Serial.print(TLVFieldLength); //for debugging
         DataIndex += 1;
 
-        switch (cdpFieldType) {
+        switch (lldpFieldType) {
 
-
-          case 0x0004: //Port Name
+          case 0x0004: //Port Name/interface. such as switch0 or eth2
             Port = 1;
-            handleCdpAsciiField( Ethernet::buffer, DataIndex + 1, TLVFieldLength - 1);
+            handlePacketAsciiField(Ethernet::buffer, DataIndex + 1, TLVFieldLength - 1);
             Port = 0;
             break;
 
@@ -202,9 +317,9 @@ void loop()
 
             break;
 
-          case 0x000a: //Device Name
+          case 0x000a: //Device ID
             Device = 1;
-            handleCdpAsciiField( Ethernet::buffer, DataIndex , (TLVFieldLength));
+            handlePacketAsciiField(Ethernet::buffer, DataIndex+2, (TLVFieldLength));
             Device = 0;
             break;
 
@@ -222,14 +337,24 @@ void loop()
         }
         DataIndex += TLVFieldLength;
       }
-      drawscreen();
-    }
+      //update the W#L# here
+      Serial.println(F("LCD_data dump"));
+      Serial.println(LCD_data[0]);
+      Serial.println(LCD_data[1]); //mac address
+      Serial.println(LCD_data[2]);
+      Serial.println(LCD_data[3]);
+      Serial.println(LCD_data[4]); //vlan
+      Serial.println(LCD_data[5]);
+      Serial.println(LCD_data[6]);
+      Serial.println(F("dump complete"));
+      //to be clear: WE HAVEN'T WRITTEN CODE TO UPDATE THE LCD YET. All the LLDP handler does is print to the serial monitor
+      }
   }
 }
 
 void handleLLDPOrgTLV( const byte a[], unsigned int offset, unsigned int lengtha) {
   unsigned int Orgtemp;
-
+  Serial.println(F(" LLDP ORG TLV handler called"));
   // for (unsigned int i = offset; i < ( offset + 3 ); ++i ) {
   //   Orgtemp += a[i];
   // }
@@ -302,14 +427,14 @@ void handleLLDPOrgTLV( const byte a[], unsigned int offset, unsigned int lengtha
         case 0x000a:
           //TIA TR-41 - Inventory - Model Name
           Model = 1;
-          handleCdpAsciiField( a, offset + 4, lengtha - 4);
+          handlePacketAsciiField( a, offset + 4, lengtha - 4);
           Model = 0;
           break;
 
           /* case 0x000b:
             //TIA TR-41 - Inventory - Asset ID
             Model = 1;
-            handleCdpAsciiField( a, offset + 4, lengtha - 4);
+            handlePacketAsciiField( a, offset + 4, lengtha - 4);
             Model = 0;
             break; */
 
@@ -333,166 +458,46 @@ void handleLLDPOrgTLV( const byte a[], unsigned int offset, unsigned int lengtha
       switch (a[offset + 3]) {
         case 0x0001:
           //IEEE - Port VLAN ID
+          Serial.println(F("IEEE IEEEE IEEE"));
           //the next octets are the vlan #
-          handleCdpNumField( a, offset + 4, 2);
+          handlePacketNumField( a, offset + 4, 2);
           break;
       }
       break;
   }
 
 }
-/*
-  String CdpCapabilities(String temp) {
 
-  String output;
-  //Serial.print(temp.substring(26,27));
-  if (temp.substring(15, 16) == "1") {
-    output = output + "Router ";
-  }
-  if (temp.substring(14, 15) == "1") {
-    output = output + "Trans_Bridge ";
-  }
-  if (temp.substring(13, 14) == "1") {
-    output = output + "Route_Bridge,";
-  }
-  if (temp.substring(12, 13) == "1") {
-    output = output + "Switch ";
-  }
-  if (temp.substring(11, 12) == "1") {
-    output = output + "Host ";
-  }
-  if (temp.substring(10, 11) == "1") {
-    output = output + "IGMP ";
-  }
-  if (temp.substring(9, 10) == "1") {
-    output = output + "Repeater ";
-  }
-
-  return output;
-  }
-
-
-  String LldpCapabilities(String temp) {
-  //Serial.print (temp);
-  String output;
-  //Serial.print(temp.substring(26,27));
-  if (temp.substring(15, 16) == "1") {
-    output = output + "Other ";
-  }
-  if (temp.substring(14, 15) == "1") {
-    output = output + "Repeater ";
-  }
-  if (temp.substring(13, 14) == "1") {
-    output = output + "Bridge ";
-  }
-  if (temp.substring(12, 13) == "1") {
-    output = output + "WLAN ";
-  }
-  if (temp.substring(11, 12) == "1") {
-    output = output + "Router ";
-  }
-  if (temp.substring(10, 11) == "1") {
-    output = output + "Telephone ";
-  }
-  if (temp.substring(9, 10) == "1") {
-    output = output + "DOCSIS ";
-  }
-
-  if (temp.substring(8, 9) == "1") {
-    output = output + "Station ";
-  }
-  return output;
-  }
-
-  void handleCdpCapabilities( const byte a[], unsigned int offset, unsigned int lengtha) {
-  int j = 0;
-  String temp;
-  if (Protocal == "CDP") {
-    for (unsigned int i = offset; i < ( offset + lengtha ); ++i , ++j) {
-      temp  =  temp + print_binary(a[i], 8);
-    }
-    LCD_data[7] = (CdpCapabilities(temp));
-  }
-
-  if (Protocal == "LLDP") {
-    for (unsigned int i = offset; i < ( offset + lengtha ); ++i , ++j) {
-      temp  =  temp + print_binary(a[i], 8)  ;
-    }
-    LCD_data[7] =  (LldpCapabilities(temp));
-  }
-  //  Serial.print(temp);
-  }
-*/
-String print_binary(int v, int num_places)
-{
-  String output;
-  int mask = 0, n;
-  for (n = 1; n <= num_places; n++)
-  {
-    mask = (mask << 1) | 0x0001;
-  }
-  v = v & mask;  // truncate v to specified number of places
-
-  while (num_places)
-  {
-    if (v & (0x0001 << num_places - 1))
-    {
-      output = output + "1" ;
-    }
-    else
-    {
-      output = output + "0" ;
-    }
-    --num_places;
-  }
-  return output;
+//formerly cdp instead of packet
+void handlePacketAsciiField(byte a[], unsigned int offset, unsigned int length) {
+  print_str(a, offset, length);
+  Serial.println(F(" packetascii handler called"));
 }
-void handleCdpNumField( const byte a[], unsigned int offset, unsigned int length) {
+
+//formerly cdp instead of packet //planned
+void handlePacketNumField(const byte a[], unsigned int offset, unsigned int length) {
   unsigned long num = 0;
   for (unsigned int i = 0; i < length; ++i) {
     num <<= 8;
     num += a[offset + i];
   }
+
+
+  //Serial.print(num, DEC);
+  //lcd.setCursor(0,1);
+  // lcd.print();
+  //lcd.setCursor(5,1);
+  //lcd.print(num);
+  //Serial.println();
   LCD_data[4] = "" + String(num, DEC);
+
 }
 
-void handleCdpVoiceVLAN( const byte a[], unsigned int offset, unsigned int length) {
-  unsigned long num = 0;
-  for (unsigned int i = offset; i < ( offset + length ); ++i) {
-    num <<= 8;
-    // Serial.print(a[i]);
-    num += a[i];
-  }
-  LCD_data[6] = String(num, DEC);
-}
-
-void handleLLDPIPField(const byte a[], unsigned int offset, unsigned int lengtha) {
-  int j = 0;
-  LCD_data[5] = "";
-  unsigned int AddressType = a[offset];
-  switch (AddressType) {
-    case 0x0001: //IPv4
-      for (unsigned int i = offset + 1; i < ( offset + 1 + 4 ); ++i , ++j) {
-        //LCD_data[5] = "";
-        LCD_data[5] += a[i], DEC;
-        if (j < 3) {
-          LCD_data[5] += ".";
-        }
-      }
-      break;
-
-    case 0x0006: //MAC address?
-      LCD_data[5] = print_mac (a, offset + 1,  6);
-      break;
-  }
-
-
-  // int lengthostring = sizeof(LCD_data[5]);
-  // LCD_data[5][lengtha] = '\0';
-  // LCD_data[5] += '\0';
-}
+//dont change this one. This is specific to CDP
 
 void handleCdpAddresses(const byte a[], unsigned int offset, unsigned int length) {
+  //Serial.println(F("Addresses: "));
+//Serial.println(F("handleCdpAddresses called"));
   unsigned long numOfAddrs = (a[offset] << 24) | (a[offset + 1] << 16) | (a[offset + 2] << 8) | a[offset + 3];
   offset += 4;
 
@@ -517,181 +522,265 @@ void handleCdpAddresses(const byte a[], unsigned int offset, unsigned int length
       if (j < 3) {
         LCD_data[5] = LCD_data[5] + ".";
       }
+      Serial.print(address[j] + ".");
+    }
+    //  uint8_t ipaddr[4];
+    //ether.parseIp(ipaddr, LCD_data[5]);
+
+
+  }
+
+}
+
+void handleCdpVoiceVLAN( const byte a[], unsigned int offset, unsigned int length) {
+  unsigned long num = 0;
+  for (unsigned int i = offset; i < ( offset + length ); ++i) {
+    num <<= 8;
+    // Serial.print(a[i]);
+    num += a[i];
+  }
+  LCD_data[6] = String(num, DEC);
+}
+
+
+  void handleLLDPIPField(const byte a[], unsigned int offset, unsigned int lengtha) {
+  Serial.println(F(" LLDPIP handler called"));
+  int j = 0;
+  LCD_data[5] = "";
+  unsigned int AddressType = a[offset];
+  switch (AddressType) {
+    case 0x0001: //IPv4
+      for (unsigned int i = offset + 1; i < ( offset + 1 + 4 ); ++i , ++j) {
+        //LCD_data[5] = "";
+        LCD_data[5] += a[i], DEC;
+        if (j < 3) {
+          LCD_data[5] += ".";
+        }
+      }
+      break;
+
+    case 0x0006: //MAC address?
+      LCD_data[5] = print_mac (a, offset + 1,  6);
+      break;
+  }
+
+
+  // int lengthostring = sizeof(LCD_data[5]);
+  // LCD_data[5][lengtha] = '\0';
+  // LCD_data[5] += '\0';
+  }
+
+//dont disable this or half the useful info will be gone
+void print_str(byte a[], unsigned int offset, unsigned int length) {
+  int j = 0;
+  char temp [40];
+
+
+  for (unsigned int i = offset; i < offset + 40; ++i , ++j) {
+    if (Device != 0) {
+
+      temp[j] = a[i];
+      //lcd.print(temp);
+      LCD_data[0] = temp;
+    }
+
+    if (Port != 0) {
+      temp[j] = a[i];
+      //lcd.print(temp);
+      LCD_data[2] = temp;
+      ;
 
     }
-  }
 
+    if (Model != 0) {
+      temp[j] = a[i];
+      //lcd.print(temp);
+      LCD_data[3] = temp;
+      ;
+    }
+    //Serial.write(a[i]);
+    //    return a[i];
+  }
+  /**
+    Serial.println(F("Debug printouts for LCD_data 0 2 3"));
+    Serial.println(LCD_data[0]);
+    Serial.println(LCD_data[2]);
+    Serial.println(LCD_data[3]);
+    Serial.println(F("Debug printout finished"));
+  */
 }
 
-void handleCdpAsciiField(byte a[], unsigned int offset, unsigned int lengtha) {
-  int j = 0;
 
-  char temp [lengtha + 1] ;
-  for (unsigned int i = offset; i < ( offset + lengtha ); ++i , ++j) {
-    temp[j] = a[i];
-  }
-  temp[lengtha  ] = '\0';
 
-  if (Device != 0) {
-    LCD_data[0] = temp;
-  }
-
-  if (Port != 0) {
-    LCD_data[2] = temp;
-  }
-
-  if (Model != 0) {
-    LCD_data[3] = temp;
-  }
-
-}
-
-String print_ip(const byte a[], unsigned int offset, unsigned int length) {
+/**
+  String print_ip(const byte a[], unsigned int offset, unsigned int length) { //is now an unused function, was used for TFT display but rewrote
   String ip;
-  for (unsigned int i = offset; i < offset + length; ++i) {
+  for(unsigned int i=offset; i<offset+length; ++i) {
     //    if(i>offset) Serial.print('.');
     //   Serial.print(a[i], DEC);
-    if (i > offset) ip = ip + '.';
+    if(i>offset) ip = ip + '.';
     ip = ip + String (a[i]);
   }
   int iplentgh;
-  return ip;
-}
+  ip=ip.substring(ip.length()-1)='\0';
 
+
+  Serial.print(ip);
+  return ip;
+  }
+*/
+//NOT arduino mac but origin mac address. dont delete this. it's handy.
 String print_mac(const byte a[], unsigned int offset, unsigned int length) {
   String Mac;
-  char temp [40];
-
+  char temp [13];
+  LCD_data[1] = "";
   for (unsigned int i = offset; i < offset + length; ++i) {
+    // if(i>offset) Serial.print(':');
+    //  if(a[i] < 0x10) Serial.print('0');
+    // Serial.print(a[i], HEX);
 
     if (i > offset) {
-      Mac = Mac + ':';
+      //  LCD_data[1] = LCD_data[1] + Mac + ':';
+      //Mac = Mac + ':'; //normally where you add the colon : which is removed for testing
     }
     if (a[i] < 0x10) {
       Mac = Mac + '0';
+      //    LCD_data[1] = LCD_data[1] + Mac + '0';
     }
     Mac = Mac + String (a[i], HEX);
   }
+  LCD_data[1] = LCD_data[1]  + Mac;
+  //Serial.println(Mac);
 
   return Mac;
 }
 
+
+
 bool byte_array_contains(const byte a[], unsigned int offset, const byte b[], unsigned int length) {
+
   for (unsigned int i = offset, j = 0; j < length; ++i, ++j) {
     if (a[i] != b[j]) {
+
       return false;
     }
+
   }
+
   return true;
 }
 
 
-void testdrawtext(String text, uint16_t color) {
-  tft.setTextColor(color);
-  tft.print(text);
-}
+void LCDupdate () {  //updates display, sequentially. I know it's bad but this works for now until we need it to be better
 
-void drawscreen () {
-  tft.fillScreen(ST7735_BLACK);
-  tft.setTextWrap(false);
-  tft.setRotation(1);
-  tft.setCursor(0, 0);
-
-  testdrawtext("MODLOG CDP/LLDP ", ST7735_RED);
-  printVolts();
-  tft.setTextColor(ST7735_RED, ST7735_BLUE);
-  if (String(ether.myip[1]) == "") {
-    testdrawtext("DHCP: None Assigned.\n", ST7735_RED);
-    Serial.println("DHCP failed.");
+  if (0 < lcdCount && lcdCount <= 10) {
+    lcd.setCursor(0, 0);
+    lcd.print(F("                ")); //WINDOW 1 LINE 1 CLEARING
+    lcd.setCursor(0, 1);
+    lcd.print(F("                ")); //WINDOW 1 LINE 2 CLEARING
+    lcd.setCursor(0, 0);
+    lcd.print(W1L1); //WINDOW 1 LINE 1
+    lcd.setCursor(0, 1);
+    lcd.print(W1L2); //WINDOW 1 LINE 2
   }
-  else
-  {
-    String DHCPtxt = "";
-    testdrawtext("DHCP IP:", ST7735_GREEN);
-    for (unsigned int j = 0; j < 4; ++j) {
-      DHCPtxt = DHCPtxt + (String(ether.myip[j]));
-      testdrawtext(String(ether.myip[j]), ST7735_WHITE);
-      if (j < 3) {
-        DHCPtxt = DHCPtxt + ".";
-        testdrawtext(".", ST7735_WHITE);
-      }
+  if (10 < lcdCount && lcdCount <= 20) {
+    lcd.setCursor(0, 0);
+    lcd.print(F("                ")); //WINDOW 1 LINE 1 CLEARING
+    lcd.setCursor(0, 1);
+    lcd.print(F("                ")); //WINDOW 1 LINE 2 CLEARING
+    lcd.setCursor(0, 0);
+    lcd.print(W2L1);
+    lcd.setCursor(0, 1);
+    lcd.print(W2L2);
+  }
+  if (20 < lcdCount && lcdCount <= 30) {
+    lcd.setCursor(0, 0);
+    lcd.print(F("                ")); //WINDOW 1 LINE 1 CLEARING
+    lcd.setCursor(0, 1);
+    lcd.print(F("                ")); //WINDOW 1 LINE 2 CLEARING
+    lcd.setCursor(0, 0);
+    lcd.print(W3L1);
+    lcd.setCursor(0, 1);
+    lcd.print(W3L2);
+  }
+  if (30 < lcdCount && lcdCount <= 40) {
+    lcd.setCursor(0, 0);
+    lcd.print(F("                ")); //WINDOW 1 LINE 1 CLEARING
+    lcd.setCursor(0, 1);
+    lcd.print(F("                ")); //WINDOW 1 LINE 2 CLEARING
+    lcd.setCursor(0, 0);
+    lcd.print(W4L1);
+    lcd.setCursor(0, 1);
+    lcd.print(W4L2);
+  }
+  if (40 < lcdCount && lcdCount <= 50) {
+    lcd.setCursor(0, 0);
+    lcd.print(F("                ")); //WINDOW 1 LINE 1 CLEARING
+    lcd.setCursor(0, 1);
+    lcd.print(F("                ")); //WINDOW 1 LINE 2 CLEARING
+    lcd.setCursor(0, 0);
+    lcd.print(W5L1);
+    lcd.setCursor(0, 1);
+    lcd.print(W5L2);
+  }
+  if (50 < lcdCount && lcdCount <= 60) {
+    //lcd.noAutoscroll();
+    lcd.setCursor(0, 0);
+    lcd.print(F("                ")); //WINDOW 1 LINE 1 CLEARING
+    lcd.setCursor(0, 1);
+    lcd.print(F("                ")); //WINDOW 1 LINE 2 CLEARING
+    lcd.setCursor(0, 0);
+    lcd.print(W6L1);
+    lcd.setCursor(0, 1);
+    lcd.print(W6L2);
+
+  }
+  if (60 < lcdCount && lcdCount <= 70) {
+    //lcd.autoscroll();
+    lcd.setCursor(0, 0);
+    lcd.print(F("                ")); //WINDOW 1 LINE 1 CLEARING
+    lcd.setCursor(0, 1);
+    lcd.print(F("                ")); //WINDOW 1 LINE 2 CLEARING
+    lcd.setCursor(0, 0);
+    lcd.print(W7L1);
+    lcd.setCursor(0, 1);
+    lcd.print(W7L2);
+  }
+  /**
+    if (70 < lcdCount && lcdCount <= 80) {
+      //lcd.autoscroll();
+      lcd.setCursor(0, 0);
+      lcd.print("                "); //WINDOW 1 LINE 1 CLEARING
+      lcd.setCursor(0, 1);
+      lcd.print("                "); //WINDOW 1 LINE 2 CLEARING
+      lcd.setCursor(0, 0);
+      lcd.print(W8L1);
+      lcd.setCursor(0, 1);
+      lcd.print(W8L2);
     }
-    testdrawtext("\n", ST7735_WHITE);
-
-    Serial.println("Device IP:" + DHCPtxt);
-    tft.setCursor(0, 20);
-    testdrawtext("Protocal:", ST7735_GREEN);
-    testdrawtext(Protocal + "\n", ST7735_WHITE);
-    testdrawtext("\n", ST7735_WHITE);
-  }
-
-  for (unsigned int i = 0; i < 8; ++i) {
-    tft.setCursor(0, i * 10 + 30);
-    testdrawtext(Names[i], ST7735_GREEN);
-    testdrawtext(LCD_data[i] + "\n", ST7735_WHITE);
-    Serial.println("" + Names[i] + "" + LCD_data[i]);
-    LCD_data[i] = "";
-  }
-
-  Serial.println("--------END-------");
-  delay(500);
-}
-
-void printVolts() {
-
-  int MinCharge = 3000;
-  int MaxCharge = 3700;
-  int DiffCharge = MaxCharge - MinCharge;
-
-  // Thank you to who every wrote the following code!! I have looked but can't find the original author.
-  // Read 1.1V reference against AVcc
-  // set the reference to Vcc and the measurement to the internal 1.1V reference
-#if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
-  ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
-#elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
-  ADMUX = _BV(MUX5) | _BV(MUX0);
-#elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
-  ADMUX = _BV(MUX3) | _BV(MUX2);
-#else
-  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
-#endif
-
-  delay(100); // Wait for Vref to settle
-  ADCSRA |= _BV(ADSC); // Start conversion
-  while (bit_is_set(ADCSRA, ADSC)); // measuring
-
-  uint8_t low  = ADCL; // must read ADCL first - it then locks ADCH
-  uint8_t high = ADCH; // unlocks both
-
-  long result = (high << 8) | low;
-  result = 1125300L / result; // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
-  float Voltage = result / 1000;
-
-  /*Serial.println("Voltage: ");
-    Serial.println(Voltage);
-
-    Serial.println("Result: ");
-    Serial.println(result);*/
-
-  float percent1 = result - MinCharge;
-  int Percent = percent1 / DiffCharge * 100;
-
-  /*Serial.println("Percent: ");
-    Serial.println(Percent);*/
-
-  //tft.setCursor(100, 0);
-  if (Percent > 100) {
-    if (Voltage > 4.7) {
-      testdrawtext("BATT:EXT\n", ST7735_ORANGE);
+    if (80 < lcdCount && lcdCount <= 90) {
+      //lcd.autoscroll();
+      lcd.setCursor(0, 0);
+      lcd.print("                "); //WINDOW 1 LINE 1 CLEARING
+      lcd.setCursor(0, 1);
+      lcd.print("                "); //WINDOW 1 LINE 2 CLEARING
+      lcd.setCursor(0, 0);
+      lcd.print(W9L1);
+      lcd.setCursor(0, 1);
+      lcd.print(W9L2);
     }
-    else
-    {
-      testdrawtext("BATT:100%\n", ST7735_YELLOW);
+  */
+  if (lcdCount > LCD_Window_control ) { //reset scrollers
+    lcdCount = 0;
+  }
+  /** activity light. not needed
+    if (lcdCount & 1 == 0) { //if lcdCount is even
+    lcd.setCursor(0, 13);
+    lcd.print(" ");
     }
-
-  }
-  else
-  {
-    testdrawtext("BATT:" + String(Percent) + "%\n", ST7735_YELLOW);
-  }
+    if (lcdCount & 1 == 1) { //if lcdCount is odd
+    lcd.setCursor(0, 13);
+    lcd.print("*");
+    }
+  */
 }
