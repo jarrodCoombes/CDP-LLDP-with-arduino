@@ -272,7 +272,7 @@ void loop()
       Serial.println(W4L2);
       
       sizeW5L2_Input = (LCD_data[2].length());
-      strcpy(W5L1, "Port ID: (trim) "); //LCD_data[2] Name
+      strcpy(W5L1, "Port ID: (trim)  "); //LCD_data[2] Name
       strcpy(W5L2, (LCD_data[2].substring(sizeW5L2_Input - 16, sizeW5L2_Input)).c_str()); //LCD_data[2] Data
       Serial.print(F("Window 5 (Port ID)   Written to LCD: "));
       Serial.println(W5L2);
@@ -771,7 +771,6 @@ void LCDupdate () {  //updates display, sequentially. I know it's bad but this w
     lcd.print(W6L1);
     lcd.setCursor(0, 1);
     lcd.print(W6L2);
-
   }
   if (60 < lcdCount && lcdCount <= 70) {
     //lcd.autoscroll();
